@@ -1,20 +1,20 @@
 //! just copy-pasted example from https://github.com/Lonami/grammers/blob/master/lib/grammers-client/examples/echo.rs
 
 use futures_util::future::{select, Either};
-use grammers_client::{Client, Config, InitParams, InputMessage, SignInError, types, Update};
+use grammers_client::{Client, Config, InitParams, InputMessage, SignInError, Update};
 use grammers_session::Session;
 use grammers_tl_types;
-use log;
-// use simple_logger::SimpleLogger;
 use std::env;
+use std::future::Future;
 use std::pin::pin;
 use std::time;
-use grammers_client::types::User;
+use grammers_client::types::{Message};
 use grammers_tl_types::enums::MessageEntity;
-use grammers_tl_types::types::{MessageEntityCustomEmoji, MessageEntityItalic, MessageEntityBold, MessageEntityUnderline};
+use grammers_tl_types::types::{MessageEntityCustomEmoji, MessageEntityItalic, MessageEntityBold, MessageEntityUnderline, MessageEntityBlockquote, MessageEntitySpoiler, MessageEntityStrike, MessageEntityPre, MessageEntityTextUrl, MessageEntityCode};
 use tokio::{runtime, task};
 use regex::Regex;
 use html_parser;
+use rand;
 
 
 type Result = std::result::Result<(), Box<dyn std::error::Error>>;
@@ -77,7 +77,7 @@ async fn sign_in(client: &Client, ) -> Result {
                     }
                 }
             }
-            Err(SignInError::SignUpRequired { terms_of_service: tos }) =>
+            Err(SignInError::SignUpRequired { terms_of_service: _tos }) =>
                 panic!("It seems to be that this number does not have a Telegram account. Please sign up on other device and continue."),
             Err(err) => {
                 println!("Failed to sign in as a user :(\n{}", err);
@@ -91,42 +91,119 @@ async fn sign_in(client: &Client, ) -> Result {
     return Ok(());
 }
 
+async fn filter1(client: &Client, message: &Message) -> bool {
+    message.outgoing() && message.text() == "/test"
+}
+async fn handler1(client: &Client, message: &Message) -> Result {
+    let chat = message.chat();
+
+    let text = "<b>bold</b>, <strong>bold</strong>\n\n<i>italic</i>, <em>italic</em>\n\n<u>underline</u>\n\n<s>strike</s>, <del>strike</del>, <strike>strike</strike>\n\n<spoiler>spoiler</spoiler>\n\n<a href=\"https://docs.rs/\">text URL</a>\n\n<a href=\"tg://user?id=123456789\">inline mention</a>\n\n<code>inline fixed-width code</code>\n\n<emoji id=\"5424780918776671920\">😀</emoji>\n\n<pre>\npre-formatted\n  fixed-width\n   code block\n</pre>\n\n<pre language=\"python\">\npre-formatted\n  fixed-width\n   code block\nwith language\n</pre>\n<blockquote>quote of great man</blockquote>";
+
+    let (text, entities) = parse_entities(&*text);
+    fn f_<T: Into<InputMessage>>(m: T) -> InputMessage {
+        return m.into();
+    }
+    let input_message = f_(text.clone());
+
+    match client.send_message(&chat, input_message.fmt_entities(entities)).await {
+        Err(e) => return Err(Box::try_from(e).unwrap()),
+        Ok(_) => { Ok(()) }
+    }
+}
+
+async fn filter2(client: &Client, message: &Message) -> bool {
+    message.outgoing() && message.text() == "/ping"
+}
+async fn handler2(client: &Client, message: &Message) -> Result {
+    let chat = message.chat();
+    let start = time::Instant::now();
+
+    println!("Responding to {}", chat.name());
+
+    let start_text = "[<emoji document_id=\"5424780918776671920\">😀</emoji>ust BOT]\n<b>Ping</b>";
+
+    let (text, entities) = parse_entities(start_text);
+    fn f_<T: Into<InputMessage>>(m: T) -> InputMessage {
+        return m.into();
+    }
+    let input_message = f_(text.clone());
+
+    match client.send_message(&chat, input_message.fmt_entities(entities)).await {
+        Err(e) => return Err(Box::try_from(e).unwrap()),
+        Ok(msg) => {
+            let duration = start.elapsed();
+            let new_text = start_text.to_owned() + &*format!(" {:.3} ms", duration.as_secs_f64() * 1000f64).as_str();
+            let (new_text, entities) = parse_entities(new_text.as_str());
+            let input_message = f_(new_text.clone());
+
+            client.edit_message(
+                &chat,
+                msg.id(),
+                input_message.fmt_entities(entities)
+            ).await?;
+            Ok(())
+        }
+    }
+}
+
+const SECRET_CHAT: i64 = 0;
+
+async fn filter3(client: &Client, message: &Message) -> bool {
+    !message.outgoing() && !message.text().is_empty() && message.chat().id() == SECRET_CHAT && rand::random::<f32>() < 0.2
+}
+async fn handler3(client: &Client, message: &Message) -> Result {
+    let chat = message.chat();
+    let text = format!("<i>Как однажды сказал один мудрый человек</i>\n<blockquote>{}</blockquote>", message.text());
+    let (text, entities) = parse_entities(&*text);
+    println!("{} {:?}", text, entities);
+    fn f_<T: Into<InputMessage>>(m: T) -> InputMessage {
+        return m.into();
+    }
+    let input_message = f_(text.clone());
+
+    match client.send_message(&chat, input_message.fmt_entities(entities)).await {
+        Err(e) => return Err(Box::try_from(e).unwrap()),
+        Ok(_) => { Ok(()) }
+    }
+}
+
+// do smth with this shit
+// i really want to store it in Vec
+
+struct S<F, U>
+    where
+        F: Future<Output=bool>,
+        U: Future<Output=Result>,
+{
+    pub filter_func: Box<dyn Fn(&Client, &Message) -> F>,
+    pub handler_func: Box<dyn Fn(&Client, &Message) -> U>,
+}
+
+impl<F, U> S<F, U>
+    where
+        F: Future<Output=bool>,
+        U: Future<Output=Result>,
+{
+    async fn filter_f(&self, client: &Client, message: &Message) -> bool {
+        (self.filter_func)(client, message).await
+    }
+    async fn handler_f(&self, client: &Client, message: &Message) -> Result {
+        (self.handler_func)(client, message).await
+    }
+}
+
 
 async fn handle_update(client: Client, update: Update) -> Result {
     match update {
-        Update::NewMessage(message) if message.outgoing() => {
-            let chat = message.chat();
-            let start = time::Instant::now();
-            if message.text() != "/ping" {
-                return Ok(());
+        Update::NewMessage(message) => {
+            if filter1(&client, &message).await {
+                return handler1(&client, &message).await;
             }
-            println!("Responding to {}", chat.name());
-
-            let start_text = "[<emoji document_id=\"5424780918776671920\">😀</emoji>ust BOT]\n<b>Ping</b>";
-
-            let (text, entities) = parse_entities(start_text);
-            println!("{} {:?}", text, entities);
-            fn f_<T: Into<InputMessage>>(m: T) -> InputMessage {
-                return m.into();
+            if filter2(&client, &message).await {
+                return handler2(&client, &message).await;
             }
-            let mut input_message = f_(text.clone());
-
-            match client.send_message(&chat, input_message.fmt_entities(entities)).await {
-                Err(e) => return Err(Box::try_from(e).unwrap()),
-                Ok(msg) => {
-                    let duration = start.elapsed();
-                    let new_text = start_text.to_owned() + &*format!(" {:.3} ms", duration.as_secs_f64() * 1000f64).as_str();
-                    let (new_text, entities) = parse_entities(new_text.as_str());
-                    let mut input_message = f_(new_text.clone());
-                    println!("{} {:?}", new_text, entities);
-
-
-                    client.edit_message(
-                        &chat,
-                        msg.id(),
-                        input_message.fmt_entities(entities)
-                    ).await?;
-                }
+            if filter3(&client, &message).await {
+                return handler3(&client, &message).await;
             }
         }
         _ => {}
@@ -198,32 +275,36 @@ async fn async_main() -> Result {
 
 fn parse_entities(text: &str) -> (String, Vec<MessageEntity>) {
     let mut result = Vec::<MessageEntity>::new();
+    let mut text = text.replace("\n", "\\n"); // kostyl
+
+    // deleting whitespaces from begin and end
+    text = Regex::new("^\\s*(<[\\w<>=\\s\"]*>)\\s*").unwrap().replace(text.as_str(), "$1").parse().unwrap();
+    text = Regex::new("\\s*(</[\\w</>]*>)\\s*$").unwrap().replace(text.as_str(), "$1").parse().unwrap();
     let mut new_text = String::new();
 
-    let r = html_parser::Dom::parse(text).unwrap();
-
-    println!("{}", r.to_json_pretty().unwrap());
+    let r = html_parser::Dom::parse(text.as_str()).unwrap();
 
     fn rec_parse(cur: &html_parser::Node, offset: usize, result: &mut Vec<MessageEntity>, new_text: &mut String) -> usize {
         if let Some(t) = cur.text() {
-            *new_text += t;
-            return t.encode_utf16().collect::<Vec<_>>().len()
+            let new_t = t.replace("\\n", "\n");
+            *new_text += &*new_t;
+            return new_t.encode_utf16().collect::<Vec<_>>().len()
         }
 
         match cur.element() {
             Some(e) => {
                 let mut len = 0;
 
-                for i in &e.children {
-                    len += rec_parse(&i, offset + len, result, new_text);
+                for i in 0..e.children.len() {
+                    len += rec_parse(&e.children[i], offset + len, result, new_text);
                 }
                 let entity = match e.name.as_str() {
-                    "i" => {
+                    "i" | "em" => {
                         Some(MessageEntity::Italic(
                             MessageEntityItalic{ offset: offset as i32, length: len as i32 })
                         )
                     }
-                    "b" => {
+                    "b" | "strong" => {
                         Some(MessageEntity::Bold(
                             MessageEntityBold{ offset: offset as i32, length: len as i32 })
                         )
@@ -232,6 +313,38 @@ fn parse_entities(text: &str) -> (String, Vec<MessageEntity>) {
                         Some(MessageEntity::Underline(
                             MessageEntityUnderline{ offset: offset as i32, length: len as i32 })
                         )
+                    }
+                    "s" | "del" | "strike" => {
+                        Some(MessageEntity::Strike(
+                            MessageEntityStrike{ offset: offset as i32, length: len as i32 })
+                        )
+                    }
+                    "code" => {
+                        Some(MessageEntity::Code(
+                            MessageEntityCode{ offset: offset as i32, length: len as i32 })
+                        )
+                    }
+                    "pre" => {
+                        if let Some(option) = e.attributes.get("language") {
+                            if let Some(language) = option {
+                                Some(MessageEntity::Pre(
+                                    MessageEntityPre{ offset: offset as i32, length: len as i32, language: language.clone() })
+                                )
+                            } else { None }
+                        } else {
+                            Some(MessageEntity::Pre(
+                                MessageEntityPre{ offset: offset as i32, length: len as i32, language: "".to_string() })
+                            )
+                        }
+                    }
+                    "a" => {
+                        if let Some(option) = e.attributes.get("href") {
+                            if let Some(url) = option {
+                                Some(MessageEntity::TextUrl(
+                                    MessageEntityTextUrl{ offset: offset as i32, length: len as i32, url: url.clone() })
+                                )
+                            } else { None }
+                        } else { None }
                     }
                     "emoji" => {
                         if let Some(option) = e.attributes.get("document_id") {
@@ -245,6 +358,16 @@ fn parse_entities(text: &str) -> (String, Vec<MessageEntity>) {
                                 MessageEntityCustomEmoji { offset: offset as i32, length: len as i32, document_id: document_id.parse::<i64>().unwrap_or(0) })
                             )
                         } else { None }
+                    }
+                    "blockquote" => {
+                        Some(MessageEntity::Blockquote(
+                            MessageEntityBlockquote{ offset: offset as i32, length: len as i32 })
+                        )
+                    }
+                    "spoiler" => {
+                        Some(MessageEntity::Spoiler(
+                            MessageEntitySpoiler{ offset: offset as i32, length: len as i32 })
+                        )
                     }
                     _ => { None }
                 };
@@ -261,6 +384,7 @@ fn parse_entities(text: &str) -> (String, Vec<MessageEntity>) {
     }
 
     let mut offset = 0usize;
+
     for i in r.children {
         offset += rec_parse(&i, offset, &mut result, &mut new_text);
     }

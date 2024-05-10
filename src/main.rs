@@ -9,13 +9,88 @@ use log;
 use std::env;
 use std::pin::pin;
 use std::time;
-use grammers_tl_types::types::MessageEntityCustomEmoji;
+use grammers_client::types::User;
+use grammers_tl_types::enums::MessageEntity;
+use grammers_tl_types::types::{MessageEntityCustomEmoji, MessageEntityItalic, MessageEntityBold, MessageEntityUnderline};
 use tokio::{runtime, task};
+use regex::Regex;
+use html_parser;
+use html_parser::Element;
 
 
 type Result = std::result::Result<(), Box<dyn std::error::Error>>;
 
 const SESSION_FILE: &str = "echo.session";
+
+fn ask_input_from_user() -> String {
+    loop {
+        let mut result = String::new();
+        match std::io::stdin().read_line(&mut result) {
+            Ok(_) => break result.trim().to_string(),
+            Err(e) => println!("Some error raised: {}", e)
+        }
+    }
+}
+
+async fn sign_in(client: &Client, ) -> Result {
+    if client.is_authorized().await? {
+        return Ok(());
+    }
+    println!("Signing in...");
+
+    let (token_or_phone, is_token) = loop {
+        println!("Enter your phone number or bot token");
+        let token_or_phone = ask_input_from_user();
+
+        let phone_regex = Regex::new(r"^[\+]?[(]?[0-9]{3}[)]?[-\s\.]?[0-9]{3}[-\s\.]?[0-9]{4,6}$").unwrap();
+        let token_regex = Regex::new(r"^\d+:[A-Za-z0-9_-]+$").unwrap();
+
+        break if token_regex.is_match(&*token_or_phone) {
+            (token_or_phone, true)
+        } else if phone_regex.is_match(&*token_or_phone) {
+            (token_or_phone, false)
+        } else {
+            println!("This is not a phone number neither bot token. Try again.");
+            continue
+        }
+    };
+
+    if is_token {
+        client.bot_sign_in(&token_or_phone).await?;
+    } else {
+        let token = client.request_login_code(&*token_or_phone).await?;
+        let code = ask_input_from_user();
+
+        let user = match client.sign_in(&token, &code).await {
+            Ok(user) => user,
+            Err(SignInError::PasswordRequired(_token)) => {
+                let hint = _token.hint().unwrap_or("None");
+                println!("You have a two-factor authentication, please enter your password: \n(Hint - {})", hint);
+                loop {
+                    let password = ask_input_from_user();
+                    break match client.check_password(_token.clone(), password).await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            println!("It seems to be some error raised: {}", e);
+                            continue;
+                        },
+                    }
+                }
+            }
+            Err(SignInError::SignUpRequired { terms_of_service: tos }) =>
+                panic!("It seems to be that this number does not have a Telegram account. Please sign up on other device and continue."),
+            Err(err) => {
+                println!("Failed to sign in as a user :(\n{}", err);
+                return Err(err.into());
+            }
+        };
+        println!("Signed in as {}!", user.first_name());
+    }
+
+    client.session().save_to_file(SESSION_FILE)?;
+    return Ok(());
+}
+
 
 async fn handle_update(client: Client, update: Update) -> Result {
     match update {
@@ -27,27 +102,23 @@ async fn handle_update(client: Client, update: Update) -> Result {
             }
             println!("Responding to {}", chat.name());
 
-            let text = "😀ust BOT\nPing";
+            let start_text = "[😀ust BOT]\n<b>Ping</b>";
+
+            let (text, entities) = parse_entities(start_text);
             fn f_<T: Into<InputMessage>>(m: T) -> InputMessage {
                 return m.into();
             }
-            let mut input_message = f_(text);
-            let entities = vec!(
-                grammers_tl_types::enums::MessageEntity::CustomEmoji(
-                    MessageEntityCustomEmoji{ offset: 0, length: 2, document_id: 5424780918776671920 }
-                )
-            );
+            let mut input_message = f_(text.clone());
 
             match client.send_message(&chat, input_message.fmt_entities(entities)).await {
-                Err(E) => return Err(Box::try_from(E).unwrap()),
+                Err(e) => return Err(Box::try_from(e).unwrap()),
                 Ok(msg) => {
                     let duration = start.elapsed();
-                    let mut input_message = f_((text.to_owned() + &*format!(" {:?}", duration)).as_str());
-                    let entities = vec!(
-                        grammers_tl_types::enums::MessageEntity::CustomEmoji(
-                            MessageEntityCustomEmoji{ offset: 0, length: 2, document_id: 5424780918776671920 }
-                        )
-                    );
+                    let new_text = start_text.clone().to_owned() + &*format!(" {:.3} ms", duration.as_secs_f64() * 1000f64).as_str();
+                    let (new_text, entities) = parse_entities(new_text.as_str());
+                    let mut input_message = f_(new_text);
+
+
                     client.edit_message(
                         &chat,
                         msg.id(),
@@ -63,7 +134,6 @@ async fn handle_update(client: Client, update: Update) -> Result {
 }
 
 
-
 async fn async_main() -> Result {
     // SimpleLogger::new()
     //     .with_level(log::LevelFilter::Debug)
@@ -72,7 +142,7 @@ async fn async_main() -> Result {
 
     let api_id = env!("TG_ID").parse().expect("TG_ID invalid");
     let api_hash = env!("TG_HASH").to_string();
-    let token = env::args().skip(1).next().expect("token missing");
+    // let token = env::args().skip(1).next().expect("token missing");
 
     println!("Connecting to Telegram...");
     let client = Client::connect(Config {
@@ -80,48 +150,17 @@ async fn async_main() -> Result {
         api_id,
         api_hash: api_hash.clone(),
         params: InitParams {
-            // Fetch the updates we missed while we were offline
-            catch_up: true,
+            catch_up: false,
             ..Default::default()
         },
     })
         .await?;
     println!("Connected!");
 
-    if !client.is_authorized().await? {
-        println!("Signing in...");
-        fn ask_code_to_user() -> String {
-            loop {
-                let mut result = "".to_string();
-                match std::io::stdin().read_line(&mut result) {
-                    Ok(_) => break result.trim().parse().unwrap(),
-                    Err(_) => println!("Invalid!")
-                }
-            }
-        }
-
-        let token = client.request_login_code(&*token).await?;
-        let code = ask_code_to_user();
-
-        let user = match client.sign_in(&token, &code).await {
-            Ok(user) => user,
-            Err(SignInError::PasswordRequired(_token)) => {
-                println!("Please provide a password");
-                let password = ask_code_to_user();
-                client
-                    .check_password(_token, password)
-                    .await.unwrap()
-            }
-            Err(SignInError::SignUpRequired { terms_of_service: tos }) => panic!("Sign up required"),
-            Err(err) => {
-                println!("Failed to sign in as a user :(\n{}", err);
-                return Err(err.into());
-            }
-        };
-
-        client.session().save_to_file(SESSION_FILE)?;
-        println!("Signed in as {}!", user.first_name());
-    }
+    match sign_in(&client, ).await {
+        Err(e) => return Err(e),
+        Ok(_) => (),
+    };
 
     println!("Waiting for messages...");
 
@@ -155,10 +194,71 @@ async fn async_main() -> Result {
     Ok(())
 }
 
+fn parse_entities(text: &str) -> (String, Vec<MessageEntity>) {
+    let mut result = Vec::<MessageEntity>::new();
+    let mut new_text = String::new();
+
+    let r = html_parser::Dom::parse(text).unwrap();
+
+    println!("{}", r.to_json_pretty().unwrap());
+
+    fn rec_parse(cur: &html_parser::Node, mut offset: usize, result: &mut Vec<MessageEntity>, new_text: &mut String) -> usize {
+        match cur.text() {
+            Some(t) => {
+                *new_text += t;
+                t.len()
+            },
+            None => {
+                match cur.element() {
+                    Some(e) => {
+                        let mut len = 0;
+
+                        for i in &e.children {
+                            len += rec_parse(&i, offset + len, result, new_text);
+                        }
+                        match e.name.as_str() {
+                            "i" => {
+                                result.push(MessageEntity::Italic(
+                                    MessageEntityItalic{ offset: offset as i32, length: len as i32 })
+                                );
+                            }
+                            "b" => {
+                                result.push(MessageEntity::Bold(
+                                    MessageEntityBold{ offset: offset as i32, length: len as i32 })
+                                );
+                            }
+                            "u" => {
+                                result.push(MessageEntity::Underline(
+                                    MessageEntityUnderline{ offset: offset as i32, length: len as i32 })
+                                );
+                            }
+                            _ => {}
+                        }
+                        len
+                    }
+                    None => { 0 }
+                }
+            }
+        }
+    }
+
+    let mut offset = 0usize;
+    for i in r.children {
+        offset += rec_parse(&i, offset, &mut result, &mut new_text);
+    }
+
+    (new_text.parse().unwrap(), result)
+}
+
+
 fn main() -> Result {
     runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
         .block_on(async_main())
+
+    // println!("{:?}", parse_entities("<b><i>huhuhu</i>joijio</b>ojijio<u>efjoeoj</u>"));
+    //
+    // Ok(())
 }

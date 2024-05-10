@@ -15,7 +15,6 @@ use grammers_tl_types::types::{MessageEntityCustomEmoji, MessageEntityItalic, Me
 use tokio::{runtime, task};
 use regex::Regex;
 use html_parser;
-use html_parser::Element;
 
 
 type Result = std::result::Result<(), Box<dyn std::error::Error>>;
@@ -45,10 +44,10 @@ async fn sign_in(client: &Client, ) -> Result {
         let phone_regex = Regex::new(r"^[\+]?[(]?[0-9]{3}[)]?[-\s\.]?[0-9]{3}[-\s\.]?[0-9]{4,6}$").unwrap();
         let token_regex = Regex::new(r"^\d+:[A-Za-z0-9_-]+$").unwrap();
 
-        break if token_regex.is_match(&*token_or_phone) {
-            (token_or_phone, true)
+        if token_regex.is_match(&*token_or_phone) {
+            break (token_or_phone, true)
         } else if phone_regex.is_match(&*token_or_phone) {
-            (token_or_phone, false)
+            break (token_or_phone, false)
         } else {
             println!("This is not a phone number neither bot token. Try again.");
             continue
@@ -59,6 +58,7 @@ async fn sign_in(client: &Client, ) -> Result {
         client.bot_sign_in(&token_or_phone).await?;
     } else {
         let token = client.request_login_code(&*token_or_phone).await?;
+        println!("The code has been successfully requested. Enter the Telegram code:");
         let code = ask_input_from_user();
 
         let user = match client.sign_in(&token, &code).await {
@@ -102,9 +102,10 @@ async fn handle_update(client: Client, update: Update) -> Result {
             }
             println!("Responding to {}", chat.name());
 
-            let start_text = "[😀ust BOT]\n<b>Ping</b>";
+            let start_text = "[<emoji document_id=\"5424780918776671920\">😀</emoji>ust BOT]\n<b>Ping</b>";
 
             let (text, entities) = parse_entities(start_text);
+            println!("{} {:?}", text, entities);
             fn f_<T: Into<InputMessage>>(m: T) -> InputMessage {
                 return m.into();
             }
@@ -114,9 +115,10 @@ async fn handle_update(client: Client, update: Update) -> Result {
                 Err(e) => return Err(Box::try_from(e).unwrap()),
                 Ok(msg) => {
                     let duration = start.elapsed();
-                    let new_text = start_text.clone().to_owned() + &*format!(" {:.3} ms", duration.as_secs_f64() * 1000f64).as_str();
+                    let new_text = start_text.to_owned() + &*format!(" {:.3} ms", duration.as_secs_f64() * 1000f64).as_str();
                     let (new_text, entities) = parse_entities(new_text.as_str());
-                    let mut input_message = f_(new_text);
+                    let mut input_message = f_(new_text.clone());
+                    println!("{} {:?}", new_text, entities);
 
 
                     client.edit_message(
@@ -202,44 +204,60 @@ fn parse_entities(text: &str) -> (String, Vec<MessageEntity>) {
 
     println!("{}", r.to_json_pretty().unwrap());
 
-    fn rec_parse(cur: &html_parser::Node, mut offset: usize, result: &mut Vec<MessageEntity>, new_text: &mut String) -> usize {
-        match cur.text() {
-            Some(t) => {
-                *new_text += t;
-                t.len()
-            },
-            None => {
-                match cur.element() {
-                    Some(e) => {
-                        let mut len = 0;
-
-                        for i in &e.children {
-                            len += rec_parse(&i, offset + len, result, new_text);
-                        }
-                        match e.name.as_str() {
-                            "i" => {
-                                result.push(MessageEntity::Italic(
-                                    MessageEntityItalic{ offset: offset as i32, length: len as i32 })
-                                );
-                            }
-                            "b" => {
-                                result.push(MessageEntity::Bold(
-                                    MessageEntityBold{ offset: offset as i32, length: len as i32 })
-                                );
-                            }
-                            "u" => {
-                                result.push(MessageEntity::Underline(
-                                    MessageEntityUnderline{ offset: offset as i32, length: len as i32 })
-                                );
-                            }
-                            _ => {}
-                        }
-                        len
-                    }
-                    None => { 0 }
-                }
-            }
+    fn rec_parse(cur: &html_parser::Node, offset: usize, result: &mut Vec<MessageEntity>, new_text: &mut String) -> usize {
+        if let Some(t) = cur.text() {
+            *new_text += t;
+            return t.encode_utf16().collect::<Vec<_>>().len()
         }
+
+        match cur.element() {
+            Some(e) => {
+                let mut len = 0;
+
+                for i in &e.children {
+                    len += rec_parse(&i, offset + len, result, new_text);
+                }
+                let entity = match e.name.as_str() {
+                    "i" => {
+                        Some(MessageEntity::Italic(
+                            MessageEntityItalic{ offset: offset as i32, length: len as i32 })
+                        )
+                    }
+                    "b" => {
+                        Some(MessageEntity::Bold(
+                            MessageEntityBold{ offset: offset as i32, length: len as i32 })
+                        )
+                    }
+                    "u" => {
+                        Some(MessageEntity::Underline(
+                            MessageEntityUnderline{ offset: offset as i32, length: len as i32 })
+                        )
+                    }
+                    "emoji" => {
+                        if let Some(option) = e.attributes.get("document_id") {
+                            if let Some(document_id) = option {
+                                Some(MessageEntity::CustomEmoji(
+                                    MessageEntityCustomEmoji { offset: offset as i32, length: len as i32, document_id: document_id.parse::<i64>().unwrap_or(0) })
+                                )
+                            } else { None }
+                        } else if let Some(document_id) = &e.id {
+                            Some(MessageEntity::CustomEmoji(
+                                MessageEntityCustomEmoji { offset: offset as i32, length: len as i32, document_id: document_id.parse::<i64>().unwrap_or(0) })
+                            )
+                        } else { None }
+                    }
+                    _ => { None }
+                };
+                if let Some(entity) = entity {
+                    if entity.length() > 0{
+                        result.push(entity);
+                    }
+                }
+                len
+            }
+            None => { 0 }
+        }
+
     }
 
     let mut offset = 0usize;
@@ -258,7 +276,7 @@ fn main() -> Result {
         .unwrap()
         .block_on(async_main())
 
-    // println!("{:?}", parse_entities("<b><i>huhuhu</i>joijio</b>ojijio<u>efjoeoj</u>"));
+    // println!("{:?}", parse_entities("<b><i>huhuhu</i>joijio</b>ojijio<u><emoji id=\"3108380\">ojefjof</emoji>efjoeoj</u>wwwd<a href=\"gjojife\">gyggy</a>"));
     //
     // Ok(())
 }
